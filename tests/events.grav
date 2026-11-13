@@ -1,0 +1,168 @@
+// apogee-events' tests: typed listeners and base-class listeners, ordering,
+// once, stoppable events, class listeners built by the container, subscribers,
+// discovery, named events with wildcards, deferred dispatch, queueing,
+// async dispatch and the fake.
+import "std"
+import "../src/events.grav"
+use apogee.*
+
+class OrderEvent extends StoppableEvent { public id: int  constructor(id: int) { self.id = id } }
+class OrderShipped extends OrderEvent { constructor(id: int) { super(id) } }
+class OrderCancelled extends OrderEvent { constructor(id: int) { super(id) } }
+
+class Journal { public lines: Array<string> = new Array<string>()  fn add(s: string) { self.lines.push(s) } fn text() -> string { return Str.join(self.lines, ",") } }
+
+// A listener class: built by the container per event (its Journal injected).
+class SendShipmentEmail extends Listener {
+    public log: Journal
+    constructor(log: Journal) { self.log = log }
+    fn handle(e: OrderShipped) { self.log.add("email ${e.id}") }
+}
+// Discovered: a Listener subclass whose handle takes an event class.
+class AuditCancellation extends Listener {
+    public log: Journal
+    constructor(log: Journal) { self.log = log }
+    fn handle(e: OrderCancelled) { self.log.add("audit ${e.id}") }
+}
+// Queued instead of run during dispatch.
+class SlowReport extends Listener {
+    constructor() {}
+    fn shouldQueue() -> bool { return true }
+    fn queue() -> string { return "reports" }
+    fn handle(e: OrderShipped) {}
+}
+
+class Billing implements Subscriber {
+    public log: Journal
+    constructor(log: Journal) { self.log = log }
+    fn subscribe(events: Events) {
+        let log = self.log
+        events.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("bill ${e.id}") })
+        events.listen::<OrderCancelled>(fn(e: OrderCancelled) { log.add("refund ${e.id}") })
+    }
+}
+
+fn setup() -> Pair<Events, Journal> {
+    let c = new Container()
+    let log = new Journal()
+    c.instance::<Journal>(log)
+    return new Pair<Events, Journal>(new Events(c), log)
+}
+
+test "listeners of the class and its bases, by priority, specific first, then order" {
+    let p = setup()
+    let ev = p.first
+    let log = p.second
+    ev.listen::<OrderEvent>(fn(e: OrderEvent) { log.add("base ${e.id}") })
+    ev.hasListeners::<OrderShipped>()                    // (asked before any dispatch: must not hide the base's)
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("a ${e.id}") })
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("b ${e.id}") })
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("first ${e.id}") }, 10)
+    ev.dispatch(new OrderShipped(1))
+    assertEq(log.text(), "first 1,a 1,b 1,base 1")
+    ev.dispatch(new OrderCancelled(2))
+    assertEq(log.lines[log.lines.size() - 1], "base 2")
+    assertEq(ev.hasListeners::<OrderCancelled>(), true)
+}
+
+test "once, stopping propagation, forget" {
+    let p = setup()
+    let ev = p.first
+    let log = p.second
+    ev.once::<OrderShipped>(fn(e: OrderShipped) { log.add("once") })
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("stopper"); e.stop() }, 5)
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("never") })
+    let e1 = ev.dispatch(new OrderShipped(1)) as OrderShipped
+    assertEq(e1.isStopped(), true)
+    assertEq(log.text(), "stopper")
+    ev.forget::<OrderShipped>()
+    ev.once::<OrderShipped>(fn(e: OrderShipped) { log.add("once") })
+    ev.dispatch(new OrderShipped(2))
+    ev.dispatch(new OrderShipped(3))
+    assertEq(log.text(), "stopper,once")
+}
+
+test "class listeners from the container, subscribers, discovery" {
+    let p = setup()
+    let ev = p.first
+    let log = p.second
+    ev.listenClass::<OrderShipped, SendShipmentEmail>()
+    ev.subscribe(new Billing(log))
+    ev.dispatch(new OrderShipped(7))
+    assertEq(log.text(), "email 7,bill 7")
+    let p2 = setup()
+    assertEq(p2.first.discover() >= 2, true)                     // AuditCancellation, SendShipmentEmail, ...
+    p2.first.dispatch(new OrderCancelled(9))
+    assertEq(Str.contains(p2.second.text(), "audit 9"), true)
+}
+
+test "queued listeners go to the queue hook" {
+    let p = setup()
+    let ev = p.first
+    let queued = new Array<string>()
+    ev.queueUsing(fn(listener: string, queue: string, e: any) { queued.push("${listener}@${queue}:${(e as OrderShipped).id}") })
+    ev.listenClass::<OrderShipped, SlowReport>()
+    ev.dispatch(new OrderShipped(4))
+    assertEq(Str.join(queued, ","), "SlowReport@reports:4")
+}
+
+test "named events and wildcards" {
+    let ev = new Events()
+    let got = new Array<string>()
+    ev.on("user.login", fn(name: string, payload: any) { got.push("exact ${payload}") })
+    ev.on("user.*", fn(name: string, payload: any) { got.push("user* ${name}") })
+    ev.on("*.created", fn(name: string, payload: any) { got.push("*created ${name}") }, 1)
+    ev.on("*", fn(name: string, payload: any) { got.push("all") }, -1)
+    ev.fire("user.login", "ada")
+    ev.fire("post.created")
+    assertEq(Str.join(got, ","), "exact ada,user* user.login,all,*created post.created,all")
+    assertEq(Events.matches("a.*.c", "a.b.c"), true)
+    assertEq(Events.matches("a.*.c", "a.b.d"), false)
+}
+
+test "transaction(): held until the body returns, dropped when it throws" {
+    let p = setup()
+    let ev = p.first
+    let log = p.second
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("shipped ${e.id}") })
+    ev.transaction(fn() {
+        ev.dispatch(new OrderShipped(1))
+        assertEq(log.text(), "")                                   // not yet
+        ev.dispatch(new OrderShipped(2))
+    })
+    assertEq(log.text(), "shipped 1,shipped 2")
+    try { ev.transaction(fn() { ev.dispatch(new OrderShipped(3)); throw new StateError("rollback") }) } catch (e: StateError) {}
+    assertEq(log.text(), "shipped 1,shipped 2")
+}
+
+test "dispatchAsync runs on the worker pool" {
+    let p = setup()
+    let ev = p.first
+    let n = new AtomicInt(0)
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { n.add(e.id as long) })
+    let fs = new Array<Future<any>>()
+    for (i in 1..11) { fs.push(ev.dispatchAsync(new OrderShipped(i))) }
+    for (f in fs) { await f }
+    assertEq(n.get(), 55 as long)
+}
+
+test "fake: record instead of telling, and assert" {
+    let p = setup()
+    let ev = p.first
+    let log = p.second
+    ev.listen::<OrderShipped>(fn(e: OrderShipped) { log.add("heard") })
+    ev.fake()
+    ev.dispatch(new OrderShipped(1))
+    ev.dispatch(new OrderShipped(2))
+    ev.fire("user.login")
+    assertEq(log.text(), "")
+    ev.assertDispatched::<OrderShipped>(2)
+    ev.assertNotDispatched::<OrderCancelled>()
+    assertEq(ev.dispatchedNamed("user.login").size(), 1)
+    let msg = ""
+    try { ev.assertDispatched::<OrderCancelled>() } catch (e: StateError) { msg = e.message() }
+    assertEq(msg, "OrderCancelled was dispatched 0 time(s), expected at least once")
+    ev.stopFaking()
+    ev.dispatch(new OrderShipped(3))
+    assertEq(log.text(), "heard")
+}
