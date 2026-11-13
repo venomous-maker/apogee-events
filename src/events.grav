@@ -1,0 +1,341 @@
+// events.grav — events: something happened; whoever cares is told.
+//
+//   let events = new Events(container)
+//   events.listen::<OrderShipped>(fn(e: OrderShipped) { audit.log(e.orderId) })
+//   events.listenClass::<OrderShipped, SendShipmentEmail>()   // built by the container per event
+//   events.subscribe(new BillingSubscriber())                  // registers several at once
+//   events.on("user.*", fn(name: string, payload: any) { ... }) // named events, wildcards
+//   events.dispatch(new OrderShipped(42))
+//
+// An event is any object; listeners of its class and of every base class
+// hear it (most specific first, then by priority). A named event is a string
+// with a payload. Listeners can stop the rest (an event extending
+// StoppableEvent calls stop()), be queued instead of run now (a hook the
+// queue package sets), or be found automatically: every class extending
+// Listener whose handle(e) takes an event class (Events.discover()).
+//
+// Registration happens at boot; dispatch is read-mostly: a class's full list
+// of listeners (its bases' merged in, ordered) is worked out once and then
+// read under a short lock, and listeners run outside it.
+import "std"
+import "apogee-container"
+
+namespace apogee {
+
+    // An event a listener can stop: listeners after the one that calls stop()
+    // are not told.
+    class StoppableEvent {
+        private stopped: bool = false
+        fn stop() { self.stopped = true; }
+        fn isStopped() -> bool { return self.stopped; }
+    }
+
+    // A listener class, for discovery and queueing: extend it and write
+    // `fn handle(e: TheEvent)`. Its decorator gives every subclass reflection,
+    // so Events.discover() finds them all.
+    @EventListener abstract class Listener {
+        // Run it on a queue instead of during dispatch (when the application
+        // has a queue; otherwise it runs now).
+        fn shouldQueue() -> bool { return false; }
+        // The queue's name ("" for the default one).
+        fn queue() -> string { return ""; }
+    }
+
+    // A class that registers several listeners at once (subscribe()).
+    interface Subscriber {
+        fn subscribe(events: Events)
+    }
+
+    // One registered listener.
+    class ListenerEntry {
+        public run: fn(any)
+        public priority: int
+        public order: int
+        // The listener class's name for a class listener ("" for a function).
+        public listenerClass: string
+        // Remove itself after the first event it hears.
+        public once: bool
+        public spent: AtomicInt
+        constructor(run: fn(any), priority: int, order: int) {
+            self.run = run; self.priority = priority; self.order = order; self.listenerClass = "";
+            self.once = false; self.spent = new AtomicInt(0);
+        }
+    }
+
+    class NamedEntry {
+        public pattern: string
+        public run: fn(string, any)
+        public priority: int
+        public order: int
+        constructor(pattern: string, run: fn(string, any), priority: int, order: int) {
+            self.pattern = pattern; self.run = run; self.priority = priority; self.order = order;
+        }
+    }
+
+    // A record of one dispatch, kept by fake().
+    class DispatchedEvent {
+        public name: string
+        public event: any
+        constructor(name: string, event: any) { self.name = name; self.event = event; }
+    }
+
+    // (dispatchAsync's task.)
+    async fn dispatchLater(events: Events, event: any) -> any { return events.dispatch(event); }
+
+    class Events {
+        public container: Container
+        // Listeners by the event class they were registered for.
+        private byClass: HashMap<string, Array<ListenerEntry>>
+        // A class's merged, ordered list (its bases' too), once worked out.
+        private merged: HashMap<string, Array<ListenerEntry>>
+        private named: Array<NamedEntry>
+        private lock: Mutex
+        private counter: int
+        // Set by a queue package: queue(listenerClass, queueName, event).
+        private queueHook: fn(string, string, any)
+        // While deferring (transaction()), events wait here.
+        private deferred: Array<any>
+        private deferring: int
+        // fake(): record instead of telling listeners (only of `fakeOnly` when given).
+        private faking: bool
+        private fakeOnly: HashSet<string>
+        private recorded: Array<DispatchedEvent>
+
+        constructor(container: Container) { self.init(container); }
+        // With a container of its own.
+        constructor() { self.init(new Container()); }
+        private fn init(container: Container) {
+            self.container = container;
+            self.byClass = new HashMap<string, Array<ListenerEntry>>();
+            self.merged = new HashMap<string, Array<ListenerEntry>>();
+            self.named = new Array<NamedEntry>();
+            self.lock = new Mutex();
+            self.counter = 0;
+            self.queueHook = null;
+            self.deferred = new Array<any>();
+            self.deferring = 0;
+            self.faking = false;
+            self.fakeOnly = new HashSet<string>();
+            self.recorded = new Array<DispatchedEvent>();
+        }
+
+        // ── registering ────────────────────────────────────────────────────────
+        // `f` hears every E (and every subclass of E); higher priority first.
+        fn listen<E>(f: fn(E), priority: int = 0) -> Events {
+            return self.add(nameof(E), new ListenerEntry(fn(e: any) { f(e as E); }, priority, 0));
+        }
+        // `f` hears the next E only.
+        fn once<E>(f: fn(E)) -> Events {
+            let entry = new ListenerEntry(fn(e: any) { f(e as E); }, 0, 0);
+            entry.once = true;
+            return self.add(nameof(E), entry);
+        }
+        // L (built by the container for each event, so its constructor's
+        // dependencies are injected) handles every E with `handle(e: E)`.
+        fn listenClass<E, L>(priority: int = 0) -> Events {
+            let c = self.container;
+            let me = self;
+            let entry = new ListenerEntry(fn(e: any) {
+                let l = c.make::<L>();
+                if (me.queueHook != null && (l as Listener).shouldQueue()) { me.queueHook(nameof(L), (l as Listener).queue(), e); return; }
+                l.handle(e as E);
+            }, priority, 0);
+            entry.listenerClass = nameof(L);
+            return self.add(nameof(E), entry);
+        }
+        // A named event's listener: `pattern` is a name, or has `*` wildcards
+        // ("user.*", "*.created", "*").
+        fn on(pattern: string, f: fn(string, any), priority: int = 0) -> Events {
+            self.lock.lock();
+            self.counter += 1;
+            self.named.push(new NamedEntry(pattern, f, priority, self.counter));
+            self.named.sortBy(fn(a: NamedEntry, b: NamedEntry) -> int {
+                return a.priority != b.priority ? b.priority - a.priority : a.order - b.order;
+            });
+            self.lock.unlock();
+            return self;
+        }
+        fn subscribe(s: Subscriber) -> Events { s.subscribe(self); return self; }
+        // Registers every concrete Listener subclass by its handle(e) method's
+        // event class (reflection: Listener's decorator gives them all
+        // metadata); how many it registered.
+        fn discover() -> int {
+            let n = 0;
+            for (cls in ClassInfo.all(reflect(Listener))) {
+                if (!cls.canCreate() && cls.constructors().size() == 0) { continue; }
+                let h = cls.method("handle");
+                if (h == null || h.paramCount() != 1 || !h.canInvoke()) { continue; }
+                let eventClass = Str.trim(h.params);
+                let c = self.container;
+                let me = self;
+                let listenerName = cls.name;
+                let entry = new ListenerEntry(fn(e: any) {
+                    let l = c.build(cls);
+                    if (me.queueHook != null && (l as Listener).shouldQueue()) { me.queueHook(listenerName, (l as Listener).queue(), e); return; }
+                    h.invoke(l, [e]);
+                }, 0, 0);
+                entry.listenerClass = listenerName;
+                self.add(eventClass, entry);
+                n += 1;
+            }
+            return n;
+        }
+        // Forgets every listener of E (class listeners and functions).
+        fn forget<E>() { self.forgetNamed(nameof(E)); }
+        fn forgetNamed(eventClass: string) {
+            self.lock.lock();
+            self.byClass.remove(eventClass);
+            self.merged.clear();
+            self.lock.unlock();
+        }
+        fn hasListeners<E>() -> bool { return self.listenersOf(nameof(E)).size() > 0; }
+        // How queued listeners are handed over (set by the queue package).
+        fn queueUsing(hook: fn(string, string, any)) { self.queueHook = hook; }
+
+        private fn add(eventClass: string, entry: ListenerEntry) -> Events {
+            self.lock.lock();
+            self.counter += 1;
+            entry.order = self.counter;
+            let list = self.byClass.getOr(eventClass, null);
+            if (list == null) { list = new Array<ListenerEntry>(); self.byClass.put(eventClass, list); }
+            list.push(entry);
+            self.merged.clear();
+            self.lock.unlock();
+            return self;
+        }
+
+        // ── dispatching ────────────────────────────────────────────────────────
+        // Tells every listener of the event's class (and its bases); returns the
+        // event (a StoppableEvent says whether it was stopped).
+        fn dispatch(event: any) -> any {
+            if (event == null) { return null; }
+            if (self.deferring > 0) { self.lock.lock(); self.deferred.push(event); self.lock.unlock(); return event; }
+            let name = typename(event);
+            if (self.faking && (self.fakeOnly.size() == 0 || self.fakeOnly.contains(name))) {
+                self.lock.lock(); self.recorded.push(new DispatchedEvent(name, event)); self.lock.unlock();
+                return event;
+            }
+            let stoppable = event is StoppableEvent ? event as StoppableEvent : null;
+            self.lock.lock();
+            let list = self.merged.getOr(name, null);
+            self.lock.unlock();
+            if (list == null) { list = self.listenersFor(name, ClassInfo.of(event)); }   // (worked out once per class)
+            for (entry in list) {
+                if (entry.once && !entry.spent.compareAndSet(0, 1)) { continue; }
+                entry.run(event);
+                if (stoppable != null && stoppable.isStopped()) { break; }
+            }
+            return event;
+        }
+        // A named event: every listener whose pattern matches `name`.
+        fn fire(name: string, payload: any = null) {
+            if (self.faking && (self.fakeOnly.size() == 0 || self.fakeOnly.contains(name))) {
+                self.lock.lock(); self.recorded.push(new DispatchedEvent(name, payload)); self.lock.unlock();
+                return;
+            }
+            self.lock.lock();
+            let matched = new Array<NamedEntry>();
+            for (n in self.named) { if (Events.matches(n.pattern, name)) { matched.push(n); } }
+            self.lock.unlock();
+            for (n in matched) { n.run(name, payload); }
+        }
+        // Dispatches on the worker pool: the caller does not wait (await the
+        // future, or not).
+        fn dispatchAsync(event: any) -> Future<any> { return dispatchLater(self, event); }
+
+        // Events dispatched inside `body` are held, then dispatched in order
+        // once it returns — or dropped when it throws (dispatch after commit:
+        // run body inside a database transaction).
+        fn transaction(body: fn()) {
+            self.lock.lock(); self.deferring += 1; self.lock.unlock();
+            let ok = false;
+            try { body(); ok = true; }
+            finally {
+                self.lock.lock();
+                self.deferring -= 1;
+                let held = new Array<any>();
+                if (self.deferring == 0) { for (e in self.deferred) { held.push(e); } self.deferred.clear(); }
+                self.lock.unlock();
+                if (ok) { for (e in held) { self.dispatch(e); } }
+            }
+        }
+
+        // A class's listeners: its own and every base class's, ordered by
+        // priority (higher first), then the more specific class, then the order
+        // they were added.
+        fn listenersOf(eventClass: string) -> Array<ListenerEntry> { return self.listenersFor(eventClass, ClassInfo.forName(eventClass)); }
+        // (`cls` is the event's class when known: any object's class knows its
+        // bases, reflection or not.)
+        private fn listenersFor(eventClass: string, cls: ClassInfo) -> Array<ListenerEntry> {
+            self.lock.lock();
+            let known = self.merged.getOr(eventClass, null);
+            if (known != null) { self.lock.unlock(); return known; }
+            let out = new Array<ListenerEntry>();
+            let depthOf = new HashMap<int, int>();
+            let depth = 0;
+            let names = new Array<string>();
+            names.push(eventClass);
+            if (cls != null) { let b = cls.base(); while (b != null) { names.push(b.name); b = b.base(); } }
+            for (n in names) {
+                let own = self.byClass.getOr(n, null);
+                if (own != null) { for (e in own) { out.push(e); depthOf.put(e.order, depth); } }
+                depth += 1;
+            }
+            out.sortBy(fn(a: ListenerEntry, b: ListenerEntry) -> int {
+                if (a.priority != b.priority) { return b.priority - a.priority; }
+                let da = depthOf[a.order];
+                let db = depthOf[b.order];
+                return da != db ? da - db : a.order - b.order;
+            });
+            if (cls != null) { self.merged.put(eventClass, out); }   // (without its class, its bases are unknown: not remembered)
+            self.lock.unlock();
+            return out;
+        }
+        // "user.*" matches "user.login"; "*" matches anything; "*.created" "post.created".
+        static fn matches(pattern: string, name: string) -> bool {
+            if (pattern == "*" || pattern == name) { return true; }
+            if (Str.indexOf(pattern, "*") < 0) { return false; }
+            let parts = Str.split(pattern, "*");
+            let pos = 0;
+            for (i, p in parts) {
+                if (p == "") { continue; }
+                let at = Str.indexOf(name[pos..], p);
+                if (at < 0 || (i == 0 && at != 0)) { return false; }
+                pos += at + p.length;
+            }
+            return Str.endsWith(pattern, "*") || pos == name.length;
+        }
+
+        // ── testing ────────────────────────────────────────────────────────────
+        // From now on dispatched events (of `only`, when given: class or event
+        // names) are recorded instead of heard.
+        fn fake(only: Array<string> = new Array<string>()) {
+            self.faking = true;
+            self.fakeOnly = new HashSet<string>();
+            for (n in only) { self.fakeOnly.add(n); }
+            self.recorded = new Array<DispatchedEvent>();
+        }
+        fn stopFaking() { self.faking = false; }
+        fn dispatched<E>() -> Array<E> {
+            let out = new Array<E>();
+            for (d in self.recorded) { if (d.event is E) { out.push(d.event as E); } }
+            return out;
+        }
+        fn dispatchedNamed(name: string) -> Array<any> {
+            let out = new Array<any>();
+            for (d in self.recorded) { if (d.name == name) { out.push(d.event); } }
+            return out;
+        }
+        // StateError unless E was dispatched `times` times (any number > 0 when -1).
+        fn assertDispatched<E>(times: int = -1) {
+            let n = self.dispatched::<E>().size();
+            if ((times < 0 && n == 0) || (times >= 0 && n != times)) {
+                throw new StateError(nameof(E) + " was dispatched ${n} time(s)" + (times >= 0 ? ", expected ${times}" : ", expected at least once"));
+            }
+        }
+        fn assertNotDispatched<E>() {
+            let n = self.dispatched::<E>().size();
+            if (n > 0) { throw new StateError(nameof(E) + " was dispatched ${n} time(s), expected none"); }
+        }
+    }
+}
