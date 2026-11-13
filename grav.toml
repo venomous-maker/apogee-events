@@ -1,0 +1,6 @@
+name = "apogee-events"
+lib = "src/events.grav"
+paths = ["src"]
+
+[dependencies]
+apogee-container = { path = "../apogee-container" }
