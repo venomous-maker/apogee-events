@@ -6,7 +6,7 @@ container, subscribers, discovery, named events with wildcards, priorities,
 stoppable events, dispatch held until a transaction commits, queued
 listeners, async dispatch, and a fake for tests.
 
-```grav
+```typescript
 import "std"
 import "apogee-events"
 
@@ -62,7 +62,7 @@ not told.
 
 ## Testing
 
-```grav
+```typescript
 events.fake()                       // or fake(["app.OrderShipped"]): only those
 checkout()
 events.assertDispatched::<OrderShipped>(1)
